@@ -1,5 +1,5 @@
 [project]
-name = "agent-template"
+name = "react-agent-template"
 version = "0.1.0"
 description = "Copier template for small ReAct + MCP agent projects."
 readme = "README.md"

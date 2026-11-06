@@ -22,6 +22,6 @@ check:
 	uv run ruff check . && uv run pytest -q -m "not slow"
 
 render:
-	rm -rf /tmp/agent-template-smoke
-	uv run copier copy --defaults --trust . /tmp/agent-template-smoke
-	cd /tmp/agent-template-smoke && uv sync --all-extras && uv run pytest -q -m "not integration"
+	rm -rf /tmp/react-agent-template-smoke
+	uv run copier copy --defaults --trust . /tmp/react-agent-template-smoke
+	cd /tmp/react-agent-template-smoke && uv sync --all-extras && uv run pytest -q -m "not integration"

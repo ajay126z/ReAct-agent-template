@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
-name = "agent-template"
+name = "react-agent-template"
 version = "0.1.0"
 source = { virtual = "." }
 

@@ -1,4 +1,4 @@
-# agent-template
+# react-agent-template
 
 A [Copier](https://copier.readthedocs.io/) template for small, readable
 ReAct + MCP agent projects.
@@ -15,7 +15,7 @@ Generated projects include:
 ## Use it
 
 ```bash
-uvx copier copy --trust gh:ajay126z/agent-template my-agent
+uvx copier copy --trust gh:ajay126z/react-agent-template my-agent
 cd my-agent
 uv sync --all-extras
 uv run my-agent doctor
@@ -25,7 +25,7 @@ uv run my-agent ask "What is (17 * 3) + 9?"
 Or from a local checkout:
 
 ```bash
-uvx copier copy --trust /path/to/agent-template my-agent
+uvx copier copy --trust /path/to/react-agent-template my-agent
 ```
 
 Non-interactive:
@@ -94,7 +94,7 @@ make render
 ## Layout
 
 ```text
-agent-template/
+react-agent-template/
   copier.yml              # questions, exclusions, tasks
   template/               # rendered into the new project
   tests/test_render.py    # render matrix
