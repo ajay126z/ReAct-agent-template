@@ -1,0 +1,31 @@
+[project]
+name = "agent-template"
+version = "0.1.0"
+description = "Copier template for small ReAct + MCP agent projects."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "copier>=9.4.0,<10",
+    "pytest>=8.0.0",
+    "ruff>=0.17.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: renders a project and installs its dependencies",
+]

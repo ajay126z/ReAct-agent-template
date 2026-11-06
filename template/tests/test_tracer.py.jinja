@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from {{ package_name }}.observability.tracer import Tracer
+
+
+def test_writes_run_and_span_artifacts(tmp_path) -> None:
+    tracer = Tracer(tmp_path, run_name="test", metadata={"k": "v"})
+    with tracer.span("agent.run", question="q"):
+        tracer.event("agent.step", step=1)
+
+    summary = tracer.close({"steps": 1})
+
+    assert (tracer.run_dir / "run.json").is_file()
+    assert (tracer.run_dir / "events.jsonl").is_file()
+    assert (tracer.run_dir / "summary.json").is_file()
+    assert summary["spans"] == 1
+    assert summary["metrics"] == {"steps": 1}
+
+    span = json.loads((tracer.run_dir / "spans.jsonl").read_text().splitlines()[0])
+    assert span["name"] == "agent.run"
+    assert span["status"] == "ok"
+    assert span["parent_id"] is None
+    assert span["attributes"]["question"] == "q"
+
+
+def test_nested_spans_have_parent(tmp_path) -> None:
+    tracer = Tracer(tmp_path)
+    with tracer.span("agent.run"), tracer.span("agent.step"):
+        pass
+    tracer.close()
+
+    spans = [json.loads(line) for line in (tracer.run_dir / "spans.jsonl").read_text().splitlines()]
+    child = next(span for span in spans if span["name"] == "agent.step")
+    parent = next(span for span in spans if span["name"] == "agent.run")
+    assert child["parent_id"] == parent["span_id"]
+
+
+def test_error_span_is_marked(tmp_path) -> None:
+    tracer = Tracer(tmp_path)
+    with pytest.raises(RuntimeError), tracer.span("agent.run"):
+        raise RuntimeError("boom")
+    tracer.close()
+
+    span = json.loads((tracer.run_dir / "spans.jsonl").read_text().splitlines()[0])
+    assert span["status"] == "error"
+    assert "boom" in span["error"]

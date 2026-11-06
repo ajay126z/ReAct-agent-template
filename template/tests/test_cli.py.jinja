@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+from {{ package_name }}.cli import build_parser
+
+
+def test_ask_parses_question() -> None:
+    args = build_parser().parse_args(["ask", "What is 2 + 2?"])
+
+    assert args.command == "ask"
+    assert args.question == ["What is 2 + 2?"]
+
+
+def test_call_parses_tool_and_args() -> None:
+    args = build_parser().parse_args(["call", "calculator", "--args", '{"expression": "2 + 2"}'])
+
+    assert args.command == "call"
+    assert args.tool == "calculator"
+    assert args.args == '{"expression": "2 + 2"}'
+
+
+def test_tools_defaults_to_configured_transport() -> None:
+    args = build_parser().parse_args(["tools"])
+
+    assert args.command == "tools"
+    assert args.transport is None
+
+
+def test_quiet_flag() -> None:
+    args = build_parser().parse_args(["ask", "--quiet", "hello"])
+
+    assert args.quiet is True

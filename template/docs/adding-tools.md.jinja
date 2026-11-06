@@ -1,0 +1,86 @@
+# Adding a tool
+
+## 1. Implement it on `Toolbox`
+
+Put deterministic logic in `{{ package_name }}/tools.py` so it is easy to unit
+test without MCP:
+
+```python
+class Toolbox:
+    def word_count(self, text: str) -> int:
+        return len(text.split())
+```
+
+Raise `ToolError` for user-fixable problems (bad input, unknown name, missing
+file). The message is returned to the model as an observation.
+
+## 2. Register a thin wrapper
+
+```python
+from typing import Annotated
+from pydantic import Field
+
+@mcp.tool(
+    title="Word count",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+)
+@instrumented
+def word_count(
+    text: Annotated[str, Field(description="Text to count.")],
+) -> int:
+    """Count whitespace-separated words."""
+    return toolbox.word_count(text)
+```
+
+Rules:
+
+- `@instrumented` must be the closest decorator. It preserves the signature
+  with `functools.wraps`, so the SDK generates the right JSON schema.
+- Annotate every argument and give it a `Field(description=...)`.
+- Keep the docstring short; it becomes the tool description.
+- Use `read_only_hint=True` for tools without side effects.
+
+## 3. Async tools, progress, and logging
+
+Make the tool `async` and add a `ctx: Context` parameter when you need progress,
+server logs, or elicitation. The SDK injects `ctx` and hides it from the schema:
+
+```python
+from mcp.server.mcpserver import Context
+
+@mcp.tool(title="Slow preview")
+@instrumented
+async def slow_preview(path: str, ctx: Context) -> str:
+    await ctx.report_progress(0, total=2, message="opening")
+    text = await asyncio.to_thread(read_file, path)
+    await ctx.report_progress(2, total=2, message="done")
+    return text
+```
+
+Wrap blocking I/O with `asyncio.to_thread`.
+
+## 4. Sandbox file access
+
+If a tool touches the filesystem, resolve the path and verify it stays under a
+fixed root:
+
+```python
+root = (PROJECT_ROOT / "data" / "workspace").resolve()
+target = (root / path).resolve()
+if not target.is_relative_to(root):
+    raise ToolError("Path escapes the workspace.")
+```
+
+Reject absolute input paths before joining. Limit read and write sizes.
+
+## 5. Test it
+
+- Unit test `Toolbox` directly, including the error paths.
+- For a real end-to-end check, mark it `@pytest.mark.integration` and call the
+  tool through `MCPClient`.
+- Restart the client after adding a tool so `tools/list` rediscovers it.
+
+## 6. Update the docs
+
+Add the tool to `README.md` and, if it changes the server's purpose, update
+`INSTRUCTIONS` in `server.py` (it is sent to MCP clients).

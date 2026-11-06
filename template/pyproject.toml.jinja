@@ -1,0 +1,51 @@
+[project]
+name = "{{ package_name | replace('_', '-') }}"
+version = "0.1.0"
+description = "{{ description }}"
+readme = "README.md"
+requires-python = ">={{ python_version }}"
+{% if author_name %}
+authors = [{ name = "{{ author_name }}"{% if author_email %}, email = "{{ author_email }}"{% endif %} }]
+{% endif %}
+{% if license == "MIT" %}
+license = { text = "MIT" }
+{% endif %}
+dependencies = [
+    "httpx>=0.27",
+    "mcp[cli]>=2.3.0,<3",
+    "pydantic-settings>=2.16.2",
+    "rich>=15.0.0",
+{% if llm_provider in ["ollama", "both"] %}
+    "ollama>=0.6.3",
+{% endif %}
+]
+
+[project.scripts]
+{{ cli_name }} = "{{ package_name }}.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.0.0",
+    "ruff>=0.17.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py{{ python_version | replace('.', '') }}"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: launches a real MCP server subprocess",
+]

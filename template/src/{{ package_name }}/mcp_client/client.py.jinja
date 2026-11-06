@@ -1,0 +1,184 @@
+"""MCP client built on the official Python SDK."""
+
+from __future__ import annotations
+
+import json
+{% if include_mcp_server %}
+import sys
+{% endif %}
+from typing import Any
+
+from mcp import Client, StdioServerParameters
+
+from ..config import PROJECT_ROOT, Settings
+from ..observability.logging import get_logger
+from ..observability.tracer import Tracer
+from .base import (
+    MCPClientError,
+    ProgressCallback,
+    ToolResult,
+    ToolSpec,
+    content_blocks_to_text,
+)
+
+log = get_logger("mcp.client")
+
+
+class MCPClient:
+    """Instrumented wrapper around ``mcp.Client``.
+
+    Supports both transports:
+    - ``stdio``: launches a local MCP server subprocess.
+    - ``http``: connects to a Streamable HTTP endpoint.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        tracer: Tracer | None = None,
+        transport: str | None = None,
+        url: str | None = None,
+    ) -> None:
+        self.settings = settings
+        self.tracer = tracer
+        self.transport = transport or settings.transport
+        self.url = url or settings.server_url
+        self._client: Client | None = None
+        self._cm: Any = None
+        self.protocol_version: str | None = None
+        self.server_name: str | None = None
+
+    def _stdio_params(self) -> StdioServerParameters:
+        if self.settings.server_command:
+            try:
+                parts = json.loads(self.settings.server_command)
+            except json.JSONDecodeError as exc:
+                raise MCPClientError(
+                    "{{ env_prefix }}SERVER_COMMAND must be a JSON list, "
+                    'for example ["uvx", "some-mcp-server"].'
+                ) from exc
+            if (
+                not isinstance(parts, list)
+                or not parts
+                or not all(isinstance(part, str) for part in parts)
+            ):
+                raise MCPClientError(
+                    "{{ env_prefix }}SERVER_COMMAND must be a non-empty JSON list of strings."
+                )
+            command, args = parts[0], parts[1:]
+        else:
+{% if include_mcp_server %}
+            command, args = sys.executable, ["-m", "{{ package_name }}.server"]
+{% else %}
+            raise MCPClientError(
+                "No MCP server configured. Set {{ env_prefix }}SERVER_COMMAND to a JSON "
+                'list such as ["uvx", "some-mcp-server"], or set '
+                "{{ env_prefix }}TRANSPORT=http and {{ env_prefix }}SERVER_URL."
+            )
+{% endif %}
+
+        return StdioServerParameters(
+            command=command,
+            args=args,
+            env=self.settings.server_env(),
+            cwd=str(PROJECT_ROOT),
+        )
+
+    def _target(self) -> Any:
+        if self.transport == "http":
+            return self.url
+        return self._stdio_params()
+
+    async def __aenter__(self) -> MCPClient:
+        target = self._target()
+        if self.tracer is not None:
+            with self.tracer.span(
+                "mcp.connect",
+                kind="client",
+                transport=self.transport,
+                target=self.url if self.transport == "http" else "stdio",
+            ):
+                await self._connect(target)
+        else:
+            await self._connect(target)
+        return self
+
+    async def _connect(self, target: Any) -> None:
+        self._cm = Client(target, read_timeout_seconds=self.settings.request_timeout)
+        self._client = await self._cm.__aenter__()
+        self.protocol_version = self._client.protocol_version
+        info = self._client.server_info
+        self.server_name = info.name if info is not None else "unknown"
+        log.info(
+            "connected server=%s protocol=%s transport=%s",
+            self.server_name,
+            self.protocol_version,
+            self.transport,
+        )
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.tracer is not None:
+            with self.tracer.span("mcp.disconnect", kind="client"):
+                await self._disconnect()
+        else:
+            await self._disconnect()
+
+    async def _disconnect(self) -> None:
+        if self._cm is not None:
+            await self._cm.__aexit__(None, None, None)
+        self._cm = None
+        self._client = None
+
+    def _require_client(self) -> Client:
+        if self._client is None:
+            raise MCPClientError("MCP client is not connected; use 'async with MCPClient(...)'.")
+        return self._client
+
+    async def list_tools(self) -> list[ToolSpec]:
+        client = self._require_client()
+        if self.tracer is not None:
+            with self.tracer.span("mcp.tools/list", kind="client") as span:
+                result = await client.list_tools()
+                span.attributes["tool_count"] = len(result.tools)
+        else:
+            result = await client.list_tools()
+
+        specs = [
+            ToolSpec(
+                name=tool.name,
+                title=tool.title,
+                description=tool.description or "",
+                input_schema=tool.input_schema or {},
+            )
+            for tool in result.tools
+        ]
+        log.debug("tools listed count=%d", len(specs))
+        return specs
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ToolResult:
+        client = self._require_client()
+        attributes = {"mcp.tool.name": name, "arguments": arguments}
+        if self.tracer is not None:
+            with self.tracer.span("mcp.tools/call", kind="client", **attributes) as span:
+                result = await client.call_tool(
+                    name, arguments, progress_callback=progress_callback
+                )
+                span.attributes["is_error"] = bool(result.is_error)
+                span.attributes["content_blocks"] = len(result.content or [])
+                self.tracer.event("mcp.tool.result", tool=name, is_error=bool(result.is_error))
+        else:
+            result = await client.call_tool(name, arguments, progress_callback=progress_callback)
+
+        text = content_blocks_to_text(list(result.content or []))
+        return ToolResult(
+            content=text,
+            is_error=bool(result.is_error),
+            structured=result.structured_content,
+        )

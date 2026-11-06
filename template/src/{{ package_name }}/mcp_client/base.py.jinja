@@ -1,0 +1,106 @@
+"""Shared MCP client types.
+
+The agent depends only on this small interface, so the SDK client can be
+replaced by a fake in tests or by another transport later.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+ProgressCallback = Callable[[float, float | None, str | None], Awaitable[None]]
+
+
+class MCPClientError(RuntimeError):
+    """Raised for client-side transport or protocol failures."""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSpec:
+    """Normalized view of an MCP tool definition."""
+
+    name: str
+    title: str | None
+    description: str
+    input_schema: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def display_name(self) -> str:
+        return self.title or self.name
+
+    @property
+    def required(self) -> list[str]:
+        return list(self.input_schema.get("required", []))
+
+    @property
+    def properties(self) -> dict[str, Any]:
+        return dict(self.input_schema.get("properties", {}))
+
+
+@dataclass(slots=True)
+class ToolResult:
+    """Normalized result of an MCP ``tools/call``."""
+
+    content: str
+    is_error: bool = False
+    structured: Any = None
+
+    @property
+    def ok(self) -> bool:
+        return not self.is_error
+
+    def as_observation(self, limit: int | None = None) -> str:
+        text = self.content
+        if not text and self.structured is not None:
+            text = json.dumps(self.structured, ensure_ascii=False, default=str)
+        text = text.strip() or "(empty result)"
+        if limit is not None and len(text) > limit:
+            text = text[:limit] + f"\n[truncated at {limit} characters]"
+        return text
+
+
+@runtime_checkable
+class MCPToolClient(Protocol):
+    """What the agent needs from an MCP client."""
+
+    async def list_tools(self) -> list[ToolSpec]: ...
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> ToolResult: ...
+
+
+def content_blocks_to_text(blocks: list[Any]) -> str:
+    """Join MCP content blocks into the text a model should read."""
+    parts: list[str] = []
+    for block in blocks or []:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+                continue
+            if "data" in block:
+                mime = block.get("mimeType") or block.get("mime_type") or "binary"
+                parts.append(f"[{mime} content, {len(str(block['data']))} chars]")
+                continue
+            parts.append(json.dumps(block, ensure_ascii=False, default=str))
+            continue
+
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        data = getattr(block, "data", None)
+        if data is not None:
+            mime = getattr(block, "mime_type", None) or getattr(block, "mimeType", "binary")
+            parts.append(f"[{mime} content, {len(str(data))} chars]")
+            continue
+        parts.append(str(block))
+    return "\n".join(parts).strip()

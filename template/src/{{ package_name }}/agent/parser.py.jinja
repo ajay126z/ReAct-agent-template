@@ -1,0 +1,185 @@
+"""Parser for text-based ReAct output.
+
+Models occasionally wrap JSON in markdown fences, add prose around it, or emit
+Python-style single quotes, so this parser is deliberately forgiving.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Literal
+
+_FINAL_RE = re.compile(r"final\s*answer\s*:\s*", re.IGNORECASE)
+_ACTION_RE = re.compile(
+    r"^\s*action\s*:\s*([A-Za-z0-9_][A-Za-z0-9_.\-/]*)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ACTION_INLINE_RE = re.compile(
+    r"\baction\s*:\s*([A-Za-z0-9_][A-Za-z0-9_.\-/]*)",
+    re.IGNORECASE,
+)
+_INPUT_RE = re.compile(r"action\s*input\s*:\s*", re.IGNORECASE)
+_THOUGHT_RE = re.compile(r"thought\s*:\s*", re.IGNORECASE)
+_OBSERVATION_RE = re.compile(r"\n\s*observation\s*:", re.IGNORECASE)
+
+
+@dataclass(slots=True)
+class ParseResult:
+    kind: Literal["final", "action", "invalid"]
+    thought: str | None = None
+    action: str | None = None
+    arguments: Any = None
+    raw_input: str | None = None
+    final_answer: str | None = None
+    raw_output: str = ""
+    error: str | None = None
+
+
+def _strip_outer_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines and lines[0].lstrip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _thought_before(text: str, index: int) -> str | None:
+    matches = list(_THOUGHT_RE.finditer(text, 0, index))
+    if matches:
+        return text[matches[-1].end() : index].strip() or None
+    prefix = text[:index].strip()
+    return prefix or None
+
+
+def _extract_first_json(text: str) -> str | None:
+    """Return the first balanced JSON object/array, ignoring braces in strings."""
+    start = next((i for i, char in enumerate(text) if char in "{["), None)
+    if start is None:
+        return None
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if not stack or stack[-1] != pairs[char]:
+                return None
+            stack.pop()
+            if not stack:
+                return text[start : index + 1]
+    return None
+
+
+def _maybe_unwrap_json(value: Any) -> Any:
+    if isinstance(value, str) and value.strip()[:1] in {"{", "["}:
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def parse_action_input(raw: str) -> tuple[Any, str | None]:
+    """Parse action input text. Returns ``(value, error)``.
+
+    On failure ``value`` is ``None`` and the caller may still use the raw text
+    when the tool takes exactly one string argument.
+    """
+    if not raw.strip():
+        return {}, None
+
+    candidates = [raw.strip()]
+    extracted = _extract_first_json(raw)
+    if extracted and extracted != candidates[0]:
+        candidates.append(extracted)
+
+    last_error: str | None = None
+    for candidate in candidates:
+        try:
+            return _maybe_unwrap_json(json.loads(candidate)), None
+        except json.JSONDecodeError as exc:
+            last_error = f"invalid JSON ({exc.msg} at position {exc.pos})"
+        try:
+            value = ast.literal_eval(candidate)
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(value, (dict, list, int, float, bool)) or value is None:
+            return _maybe_unwrap_json(value), None
+
+    return None, last_error or "Action Input is not valid JSON."
+
+
+def parse_react_output(text: str) -> ParseResult:
+    """Parse one model turn into a final answer, a tool action, or an error."""
+    raw = text or ""
+    cleaned = _strip_outer_fence(raw)
+    final_match = _FINAL_RE.search(cleaned)
+    block_action = _ACTION_RE.search(cleaned)
+    action_match = block_action
+    if action_match is None:
+        inline = _ACTION_INLINE_RE.search(cleaned)
+        if inline and inline.group(1).lower() != "input":
+            action_match = inline
+
+    if final_match and (action_match is None or final_match.start() < action_match.start()):
+        end = len(cleaned)
+        if block_action is not None and block_action.start() > final_match.end():
+            end = block_action.start()
+        answer = _strip_outer_fence(cleaned[final_match.end() : end].strip())
+        if answer:
+            return ParseResult(
+                kind="final",
+                thought=_thought_before(cleaned, final_match.start()),
+                final_answer=answer,
+                raw_output=raw,
+            )
+
+    if action_match is not None:
+        action = action_match.group(1).strip()
+        input_match = _INPUT_RE.search(cleaned, action_match.end())
+        raw_input = ""
+        if input_match is not None:
+            raw_input = cleaned[input_match.end() :]
+        raw_input = _OBSERVATION_RE.split(raw_input, maxsplit=1)[0]
+        raw_input = _strip_outer_fence(raw_input).strip()
+        arguments, error = parse_action_input(raw_input)
+        return ParseResult(
+            kind="action",
+            thought=_thought_before(cleaned, action_match.start()),
+            action=action,
+            arguments=arguments,
+            raw_input=raw_input,
+            raw_output=raw,
+            error=error,
+        )
+
+    thought = None
+    thought_match = _THOUGHT_RE.search(cleaned)
+    if thought_match:
+        thought = cleaned[thought_match.end() :].strip() or None
+    return ParseResult(
+        kind="invalid",
+        thought=thought,
+        raw_output=raw,
+        error="No 'Action:' or 'Final Answer:' was found.",
+    )

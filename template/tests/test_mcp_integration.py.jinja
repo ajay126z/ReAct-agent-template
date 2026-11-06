@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+import pytest
+
+from {{ package_name }}.config import Settings
+from {{ package_name }}.mcp_client.client import MCPClient
+
+pytestmark = pytest.mark.integration
+
+
+async def test_server_exposes_sample_tools(settings: Settings) -> None:
+    settings = settings.model_copy(update={"provider": "fake", "transport": "stdio"})
+
+    async with MCPClient(settings) as client:
+        tools = await client.list_tools()
+
+    assert {"calculator", "get_current_time"} <= {tool.name for tool in tools}
+
+
+async def test_calculator_round_trip(settings: Settings) -> None:
+    settings = settings.model_copy(update={"provider": "fake", "transport": "stdio"})
+
+    async with MCPClient(settings) as client:
+        result = await client.call_tool("calculator", {"expression": "(17 * 3) + 9"})
+
+    assert result.is_error is False
+    assert result.content.strip() == "60"

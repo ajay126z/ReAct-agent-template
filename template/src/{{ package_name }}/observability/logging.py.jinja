@@ -1,0 +1,50 @@
+"""Logging setup.
+
+MCP stdio servers use stdout as the wire, so every log line goes to stderr.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from rich.console import Console
+from rich.logging import RichHandler
+
+_CONFIGURED = False
+_QUIET = False
+
+
+def setup_logging(level: str = "INFO", quiet: bool = False) -> None:
+    """Configure root logging once, always on stderr."""
+    global _CONFIGURED, _QUIET
+    if _CONFIGURED:
+        _QUIET = _QUIET or quiet
+        logging.getLogger().setLevel("WARNING" if _QUIET else level)
+        return
+
+    handler = RichHandler(
+        console=Console(stderr=True),
+        rich_tracebacks=True,
+        markup=False,
+        show_path=False,
+        show_time=True,
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[handler],
+        force=True,
+    )
+
+    for noisy in ("httpx", "httpcore", "mcp", "ollama"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    _QUIET = quiet
+    if quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+    _CONFIGURED = True
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a namespaced logger."""
+    return logging.getLogger("{{ package_name }}." + name)

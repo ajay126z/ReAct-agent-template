@@ -1,0 +1,29 @@
+from __future__ import annotations
+
+from {{ package_name }}.config import Settings, load_settings
+
+
+def test_env_prefix(monkeypatch) -> None:
+    monkeypatch.setenv("{{ env_prefix }}MODEL", "from-env")
+    settings = Settings(_env_file=None)
+
+    assert settings.model == "from-env"
+
+
+def test_overrides_ignore_none() -> None:
+    settings = load_settings(model="override", max_steps=None)
+
+    assert settings.model == "override"
+
+
+def test_paths_resolve_relative_to_cwd(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(_env_file=None, trace_dir="custom-traces")
+
+    assert settings.trace_dir == (tmp_path / "custom-traces").resolve()
+
+
+def test_server_env_contains_log_level() -> None:
+    settings = Settings(_env_file=None, log_level="DEBUG")
+
+    assert settings.server_env()["{{ env_prefix }}LOG_LEVEL"] == "DEBUG"

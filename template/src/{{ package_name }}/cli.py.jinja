@@ -1,0 +1,628 @@
+"""Command-line interface.
+
+Examples::
+
+    {{ cli_name }} tools
+    {{ cli_name }} call calculator --args '{"expression": "(17 * 3) + 9"}'
+    {{ cli_name }} ask "What is (17 * 3) + 9, and what time is it in UTC?"
+    {{ cli_name }} serve --http
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import platform
+import sys
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+
+from rich.json import JSON
+from rich.text import Text
+
+from . import __version__
+from .agent.llm import LLMError, build_llm
+{% if include_sessions -%}
+from .agent.memory import ConversationMemory, ConversationTurn, SessionStore
+{% endif -%}
+from .agent.react import AgentConfig, ReActAgent
+from .config import Settings, load_settings
+from .mcp_client.base import MCPClientError
+from .mcp_client.client import MCPClient
+from .observability import render
+from .observability.logging import setup_logging
+from .observability.tracer import Tracer
+{% if include_mcp_server -%}
+from .server import run_server
+{% endif %}
+
+
+# ---------------------------------------------------------------------------
+# parser
+# ---------------------------------------------------------------------------
+def _common_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--provider",
+{% if llm_provider == "both" %}
+        choices=["ollama", "openai"],
+{% elif llm_provider == "ollama" %}
+        choices=["ollama"],
+{% else %}
+        choices=["openai"],
+{% endif %}
+        help="Model provider (default: {{ env_prefix }}PROVIDER)",
+    )
+    parser.add_argument("--model", help="Model name (default: {{ env_prefix }}MODEL)")
+    parser.add_argument("--max-steps", type=int, help="Maximum ReAct steps")
+    parser.add_argument("--temperature", type=float, help="Sampling temperature")
+    parser.add_argument("--transport", choices=["stdio", "http"], help="MCP transport")
+    parser.add_argument("--server-url", help="Streamable HTTP MCP endpoint")
+    parser.add_argument(
+        "--server-command",
+        help='Stdio server command as a JSON list, e.g. ["uvx", "server"]',
+    )
+    parser.add_argument("--trace-dir", help="Directory for trace artifacts")
+    parser.add_argument("--no-trace", action="store_true", help="Disable JSONL trace files")
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Log verbosity",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Only print the final answer")
+    return parser
+
+
+{% if include_sessions %}
+def _add_session_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-s",
+        "--session",
+        metavar="NAME",
+        help="Resume or create a named session under data/sessions/",
+    )
+    parser.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="Resume the most recently updated session",
+    )
+
+
+{% endif %}
+def build_parser() -> argparse.ArgumentParser:
+    common = _common_parser()
+    parser = argparse.ArgumentParser(
+        prog="{{ cli_name }}",
+        description="{{ description }}",
+    )
+    parser.add_argument("--version", action="version", version=f"{{ cli_name }} {__version__}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+{% if include_mcp_server %}
+    serve = sub.add_parser("serve", parents=[common], help="Run the MCP server")
+    serve.add_argument("--http", action="store_true", help="Serve Streamable HTTP")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+
+{% endif %}
+    sub.add_parser("tools", parents=[common], help="List MCP tools")
+
+    call = sub.add_parser("call", parents=[common], help="Call one MCP tool directly")
+    call.add_argument("tool")
+    call.add_argument("--args", default="{}", help="JSON object of tool arguments")
+
+    ask = sub.add_parser("ask", parents=[common], help="Ask the ReAct agent one question")
+    ask.add_argument("question", nargs="+")
+{% if include_sessions %}
+    _add_session_args(ask)
+{% endif %}
+
+{% if include_sessions %}
+    repl = sub.add_parser("repl", parents=[common], help="Interactive agent session")
+    _add_session_args(repl)
+
+    session = sub.add_parser("session", parents=[common], help="Manage saved sessions")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    session_sub.add_parser("list", parents=[common], help="List saved sessions")
+    delete = session_sub.add_parser("delete", parents=[common], help="Delete a saved session")
+    delete.add_argument("session_name", metavar="NAME")
+{% else %}
+    sub.add_parser("repl", parents=[common], help="Interactive agent session")
+{% endif %}
+
+    sub.add_parser("doctor", parents=[common], help="Check the provider and the MCP server")
+    return parser
+
+
+def _settings_from_args(args: argparse.Namespace) -> Settings:
+    return load_settings(
+        provider=getattr(args, "provider", None),
+        model=getattr(args, "model", None),
+        max_steps=getattr(args, "max_steps", None),
+        temperature=getattr(args, "temperature", None),
+        transport=getattr(args, "transport", None),
+        server_url=getattr(args, "server_url", None),
+        server_command=getattr(args, "server_command", None),
+        trace_dir=getattr(args, "trace_dir", None),
+        trace_enabled=False if getattr(args, "no_trace", False) else None,
+        log_level=getattr(args, "log_level", None),
+    )
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _package_version(name: str) -> str:
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def _make_tracer(
+    settings: Settings,
+    *,
+    run_name: str,
+    metadata: dict[str, Any] | None = None,
+) -> Tracer | None:
+    if not settings.trace_enabled:
+        return None
+    base = {
+        "provider": settings.provider,
+        "model": settings.model,
+        "transport": settings.transport,
+        "server_url": settings.server_url,
+        "python": platform.python_version(),
+        "cwd": str(Path.cwd()),
+    }
+    base.update(metadata or {})
+    return Tracer(settings.trace_dir, run_name=run_name, metadata=base)
+
+
+def _trace_label(tracer: Tracer | None, settings: Settings) -> str:
+    return str(tracer.run_dir) if tracer is not None else f"{settings.trace_dir} (disabled)"
+
+
+def _close_tracer(tracer: Tracer | None, metrics: dict[str, Any] | None, *, quiet: bool) -> None:
+    if tracer is None:
+        return
+    tracer.close(metrics or {})
+    if not quiet:
+        if metrics:
+            render.print_metrics(metrics)
+        render.console.print(f"[dim]trace:[/dim] {tracer.run_dir}")
+
+
+def _agent_config(settings: Settings) -> AgentConfig:
+    return AgentConfig(
+        max_steps=settings.max_steps,
+        max_parse_retries=settings.max_parse_retries,
+        max_observation_chars=settings.max_observation_chars,
+        model=settings.model,
+    )
+
+
+{% if include_sessions %}
+def _session_context(
+    args: argparse.Namespace, settings: Settings
+) -> tuple[str | None, SessionStore]:
+    store = SessionStore(settings.session_dir)
+    name = getattr(args, "session", None)
+    if getattr(args, "continue_session", False):
+        name = store.latest()
+        if name is None:
+            raise ValueError("No saved sessions found.")
+    if name:
+        name = store.validate_name(name)
+    return name, store
+
+
+def _load_memory(store: SessionStore, name: str | None, settings: Settings) -> ConversationMemory:
+    if name is None:
+        return ConversationMemory(max_turns=settings.memory_turns, max_chars=settings.memory_chars)
+    return store.load(name, max_turns=settings.memory_turns, max_chars=settings.memory_chars)
+
+
+def _record_turn(
+    store: SessionStore,
+    name: str | None,
+    memory: ConversationMemory,
+    *,
+    question: str,
+    answer: str,
+    settings: Settings,
+) -> ConversationTurn:
+    turn = ConversationTurn.create(question, answer, model=settings.model)
+    if name is not None:
+        store.append(name, turn)
+    memory.add(turn)
+    return turn
+
+
+{% endif %}
+def _configure_readline() -> None:
+    try:
+        import readline
+    except ImportError:
+        return
+    readline.set_history_length(1000)
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+async def _cmd_tools(args: argparse.Namespace, settings: Settings) -> int:
+    tracer = _make_tracer(settings, run_name="tools")
+    try:
+        async with MCPClient(settings, tracer=tracer) as client:
+            tools = await client.list_tools()
+            if args.quiet:
+                for tool in tools:
+                    render.console.print(tool.name)
+            else:
+                render.print_capabilities(
+                    protocol_version=client.protocol_version or "?",
+                    server=client.server_name or "?",
+                    tools=len(tools),
+                )
+                render.print_tools(tools)
+        return 0
+    finally:
+        _close_tracer(tracer, {}, quiet=args.quiet)
+
+
+async def _cmd_call(args: argparse.Namespace, settings: Settings) -> int:
+    try:
+        arguments = json.loads(args.args)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--args is not valid JSON: {exc}") from exc
+    if not isinstance(arguments, dict):
+        raise ValueError("--args must be a JSON object")
+
+    tracer = _make_tracer(
+        settings,
+        run_name="call",
+        metadata={"tool": args.tool, "arguments": arguments},
+    )
+    try:
+        async with MCPClient(settings, tracer=tracer) as client:
+            result = await client.call_tool(args.tool, arguments)
+        if result.structured is not None:
+            payload = json.dumps(result.structured, ensure_ascii=False, default=str)
+            render.console.print(JSON(payload))
+        else:
+            render.print_result(f"tool: {args.tool}", result.content, is_error=result.is_error)
+        return 1 if result.is_error else 0
+    finally:
+        _close_tracer(tracer, {}, quiet=args.quiet)
+
+
+async def _cmd_ask(args: argparse.Namespace, settings: Settings) -> int:
+    question = " ".join(args.question).strip()
+{% if include_sessions %}
+    session_name, store = _session_context(args, settings)
+    memory = _load_memory(store, session_name, settings)
+    history = [(turn.question, turn.answer) for turn in memory.turns]
+{% else %}
+    session_name = None
+    history = []
+{% endif %}
+    metadata: dict[str, Any] = {"question": question}
+    if session_name is not None:
+        metadata["session"] = session_name
+    tracer = _make_tracer(settings, run_name="ask", metadata=metadata)
+    metrics: dict[str, Any] = {}
+    try:
+        if not args.quiet:
+            render.print_banner(
+                model=settings.model,
+                transport=settings.transport,
+                trace_dir=_trace_label(tracer, settings),
+                session=session_name,
+            )
+        async with MCPClient(settings, tracer=tracer) as client:
+            tools = await client.list_tools()
+            if not tools:
+                raise RuntimeError("The MCP server exposed no tools.")
+            llm = build_llm(settings, tracer=tracer)
+            agent = ReActAgent(
+                llm=llm,
+                client=client,
+                tools=tools,
+                config=_agent_config(settings),
+                tracer=tracer,
+                show_steps=not args.quiet,
+            )
+            try:
+                result = await agent.run(question, history=history)
+            finally:
+                await llm.aclose()
+        metrics = result.metrics.as_dict()
+{% if include_sessions %}
+        _record_turn(
+            store,
+            session_name,
+            memory,
+            question=question,
+            answer=result.answer,
+            settings=settings,
+        )
+{% endif %}
+        if args.quiet:
+            render.console.print(Text(result.answer))
+{% if include_sessions %}
+        elif session_name is not None:
+            render.print_session_status(
+                session=session_name,
+                turns=len(memory),
+                trace=str(tracer.run_dir) if tracer is not None else None,
+            )
+{% endif %}
+        return 0
+    finally:
+        _close_tracer(tracer, metrics, quiet=args.quiet)
+
+
+async def _cmd_repl(args: argparse.Namespace, settings: Settings) -> int:
+{% if include_sessions %}
+    session_name, store = _session_context(args, settings)
+    memory = _load_memory(store, session_name, settings)
+    history = [(turn.question, turn.answer) for turn in memory.turns]
+{% else %}
+    session_name = None
+    history = []
+{% endif %}
+    metadata: dict[str, Any] = {"session": session_name} if session_name else {}
+    tracer = _make_tracer(settings, run_name="repl", metadata=metadata)
+    metrics: dict[str, Any] = {}
+    try:
+        if not args.quiet:
+            render.print_banner(
+                model=settings.model,
+                transport=settings.transport,
+                trace_dir=_trace_label(tracer, settings),
+                session=session_name,
+            )
+        async with MCPClient(settings, tracer=tracer) as client:
+            tools = await client.list_tools()
+            if not tools:
+                raise RuntimeError("The MCP server exposed no tools.")
+            llm = build_llm(settings, tracer=tracer)
+            agent = ReActAgent(
+                llm=llm,
+                client=client,
+                tools=tools,
+                config=_agent_config(settings),
+                tracer=tracer,
+                show_steps=not args.quiet,
+            )
+            try:
+                render.print_tools(tools)
+                render.print_note(
+                    "Commands: {% if include_sessions %}:history  :reset  {% endif %}:metrics  "
+                    ":trace  :model  :tools  :help  :clear  :exit  (Ctrl-D or Ctrl-C also exits)"
+                )
+                _configure_readline()
+                while True:
+                    try:
+                        question = await asyncio.to_thread(input, "\nyou> ")
+                    except EOFError:
+                        break
+                    except KeyboardInterrupt:
+                        render.console.print()
+                        break
+                    question = question.strip()
+                    if not question:
+                        continue
+                    lowered = question.lower()
+                    if lowered in {":exit", ":quit", "exit", "quit"}:
+                        break
+                    if lowered == ":tools":
+                        render.print_tools(tools)
+                        continue
+                    if lowered == ":help":
+                        render.print_note(
+                            "Type a question, or {% if include_sessions %}:history, :reset, "
+                            "{% endif %}:metrics, :trace, :model, :tools, :clear, :exit."
+                        )
+                        continue
+                    if lowered == ":clear":
+                        render.console.clear()
+                        continue
+{% if include_sessions %}
+                    if lowered == ":history":
+                        render.print_history(memory.turns)
+                        continue
+                    if lowered == ":reset":
+                        archived = store.reset(session_name) if session_name else None
+                        memory.clear()
+                        if archived is not None:
+                            render.print_note(
+                                f"Archived {session_name} to {archived}. Starting fresh."
+                            )
+                        elif session_name is not None:
+                            render.print_note(
+                                f"Session {session_name} had no saved turns. Starting fresh."
+                            )
+                        else:
+                            render.print_note("Conversation history cleared.")
+                        continue
+{% endif %}
+                    if lowered == ":metrics":
+                        if metrics:
+                            render.print_metrics(metrics)
+                        else:
+                            render.print_note("No completed run yet.")
+                        continue
+                    if lowered == ":trace":
+                        if tracer is not None:
+                            render.print_text("trace", str(tracer.run_dir))
+                        else:
+                            render.print_note("Tracing is disabled.")
+                        continue
+                    if lowered == ":model":
+                        render.print_text("model", settings.model)
+                        continue
+                    result = await agent.run(question, history=history)
+                    metrics = result.metrics.as_dict()
+{% if include_sessions %}
+                    _record_turn(
+                        store,
+                        session_name,
+                        memory,
+                        question=question,
+                        answer=result.answer,
+                        settings=settings,
+                    )
+                    history = [(turn.question, turn.answer) for turn in memory.turns]
+{% else %}
+                    history.append((question, result.answer))
+{% endif %}
+                    if not args.quiet:
+                        render.print_session_status(
+                            session=session_name,
+                            turns={% if include_sessions %}len(memory){% else %}len(history){% endif %},
+                            trace=str(tracer.run_dir) if tracer is not None else None,
+                        )
+            finally:
+                await llm.aclose()
+        return 0
+    finally:
+        _close_tracer(tracer, metrics, quiet=args.quiet)
+
+
+{% if include_sessions %}
+async def _cmd_session(args: argparse.Namespace, settings: Settings) -> int:
+    store = SessionStore(settings.session_dir)
+    if args.session_command == "list":
+        sessions = store.list_sessions()
+        if args.quiet:
+            for session in sessions:
+                render.console.print(session.name)
+        else:
+            render.print_sessions(sessions)
+        return 0
+    if args.session_command == "delete":
+        if not store.delete(args.session_name):
+            raise ValueError(f"No session named {args.session_name!r}.")
+        if args.quiet:
+            render.console.print(args.session_name)
+        else:
+            render.print_note(f"Deleted session {args.session_name}.")
+        return 0
+    raise ValueError(f"Unknown session command: {args.session_command!r}")
+
+
+{% endif %}
+async def _cmd_doctor(args: argparse.Namespace, settings: Settings) -> int:
+    all_ok = True
+    render.print_doctor_row("python", True, platform.python_version())
+    render.print_doctor_row("mcp sdk", True, _package_version("mcp"))
+{% if llm_provider in ["ollama", "both"] %}
+    render.print_doctor_row("ollama pkg", True, _package_version("ollama"))
+{% endif %}
+
+    if settings.provider == "fake":
+        render.print_doctor_row("provider", True, "fake (scripted; tests only)")
+    else:
+        llm = build_llm(settings)
+        try:
+            models = await llm.list_models()
+            detail = f"{len(models)} model(s)"
+            if settings.provider == "ollama":
+                detail += f" at {settings.ollama_host}"
+            else:
+                detail += f" at {settings.openai_base_url}"
+            render.print_doctor_row(settings.provider, True, detail)
+            model_ok = settings.model in models or any(
+                candidate.split(":")[0] == settings.model.split(":")[0] for candidate in models
+            )
+            render.print_doctor_row(
+                "model",
+                model_ok,
+                settings.model + (" is available" if model_ok else " is NOT in the model list"),
+            )
+            all_ok = all_ok and model_ok
+        except LLMError as exc:
+            render.print_doctor_row(settings.provider, False, str(exc))
+            all_ok = False
+        finally:
+            await llm.aclose()
+
+    try:
+        protocol = "?"
+        async with MCPClient(settings) as client:
+            tools = await client.list_tools()
+            protocol = client.protocol_version or "?"
+        render.print_doctor_row(
+            "mcp server", True, f"{len(tools)} tool(s), protocol {protocol}, {settings.transport}"
+        )
+    except Exception as exc:
+        render.print_doctor_row("mcp server", False, f"{type(exc).__name__}: {exc}")
+        all_ok = False
+
+    return 0 if all_ok else 1
+
+
+async def _dispatch(args: argparse.Namespace, settings: Settings) -> int:
+    if args.command == "tools":
+        return await _cmd_tools(args, settings)
+    if args.command == "call":
+        return await _cmd_call(args, settings)
+    if args.command == "ask":
+        return await _cmd_ask(args, settings)
+    if args.command == "repl":
+        return await _cmd_repl(args, settings)
+{% if include_sessions %}
+    if args.command == "session":
+        return await _cmd_session(args, settings)
+{% endif %}
+    if args.command == "doctor":
+        return await _cmd_doctor(args, settings)
+    raise ValueError(f"Unknown command: {args.command!r}")
+
+
+# ---------------------------------------------------------------------------
+# entrypoint
+# ---------------------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    settings = _settings_from_args(args)
+    if args.quiet and args.log_level is None:
+        settings = settings.model_copy(update={"log_level": "WARNING"})
+    setup_logging(settings.log_level, quiet=args.quiet)
+
+    try:
+{% if include_mcp_server %}
+        if args.command == "serve":
+            transport = "http" if args.http else settings.transport
+            run_server(
+                transport=transport,
+                host=args.host,
+                port=args.port,
+                settings=settings,
+            )
+            return 0
+
+{% endif %}
+        return asyncio.run(_dispatch(args, settings))
+    except KeyboardInterrupt:
+        render.console.print("\n[dim]interrupted[/dim]")
+        return 130
+    except (LLMError, MCPClientError, RuntimeError, ValueError) as exc:
+        render.print_error(str(exc))
+        return 1
+    except Exception as exc:  # pragma: no cover - unexpected CLI failure
+        render.print_error(f"{type(exc).__name__}: {exc}")
+        if settings.log_level == "DEBUG":
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

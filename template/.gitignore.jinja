@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local configuration and generated artifacts
+.env
+traces/
+{% if include_sessions %}
+data/sessions/
+{% endif %}

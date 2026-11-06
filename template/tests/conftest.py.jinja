@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from {{ package_name }}.config import Settings
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings(
+        _env_file=None,
+        provider="fake",
+        model="test-model",
+{% if include_sessions %}
+        session_dir=tmp_path / "sessions",
+{% endif %}
+        trace_dir=tmp_path / "traces",
+        trace_enabled=False,
+        request_timeout=10,
+        max_steps=4,
+        max_parse_retries=1,
+    )

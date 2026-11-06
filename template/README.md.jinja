@@ -1,0 +1,181 @@
+# {{ project_name }}
+
+{{ description }}
+
+A small text ReAct agent that discovers tools over the Model Context Protocol
+(MCP). The reasoning loop is plain text, so every Thought, Action, and
+Observation is visible in the terminal and in the trace files.
+
+```text
+question -> ReActAgent -> LLM ({{ default_model }})
+                |
+           MCPClient
+                |
+        JSON-RPC over stdio
+                |
+           MCP server
+{% if include_mcp_server %}
+      calculator, current time
+{% else %}
+      external tools
+{% endif %}
+```
+
+## Requirements
+
+- Python {{ python_version }}+ and [uv](https://docs.astral.sh/uv/)
+{% if llm_provider in ["ollama", "both"] %}
+- [Ollama](https://ollama.com/) with a model installed:
+  `ollama pull {{ default_model }}`
+{% endif %}
+{% if llm_provider in ["openai", "both"] %}
+- An OpenAI-compatible endpoint and (unless it is local) an API key
+{% endif %}
+
+## Quick start
+
+```bash
+uv sync --all-extras
+cp .env.example .env
+uv run {{ cli_name }} doctor
+uv run {{ cli_name }} tools
+uv run {{ cli_name }} ask "What is (17 * 3) + 9, and what time is it in UTC?"
+```
+
+`ask` prints each Thought, Action, and Observation, then the final answer and
+run metrics. Use `--quiet` for just the answer.
+
+{% if not include_mcp_server %}
+This project was generated without a bundled MCP server. Point it at an
+external server before running `doctor`, `tools`, or `ask`:
+
+```bash
+export {{ env_prefix }}SERVER_COMMAND='["uvx", "some-mcp-server"]'
+# or use an existing Streamable HTTP endpoint:
+export {{ env_prefix }}TRANSPORT=http
+export {{ env_prefix }}SERVER_URL=http://127.0.0.1:8000/mcp
+```
+{% endif %}
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `{{ cli_name }} doctor` | Check the provider, model, and MCP server. |
+| `{{ cli_name }} tools` | Connect over MCP and list tools. |
+| `{{ cli_name }} call <tool> --args '<json>'` | Call one tool without the model. |
+| `{{ cli_name }} ask "<question>"` | Run the agent once. |
+| `{{ cli_name }} repl` | Interactive agent session. |
+{% if include_sessions %}
+| `{{ cli_name }} repl --session NAME` | Resume or create a saved session. |
+| `{{ cli_name }} repl --continue` | Resume the most recent session. |
+| `{{ cli_name }} session list` | List saved sessions. |
+| `{{ cli_name }} session delete NAME` | Delete a saved session. |
+{% endif %}
+{% if include_mcp_server %}
+| `{{ cli_name }} serve` | Run the bundled MCP server over stdio. |
+| `{{ cli_name }} serve --http --port 8000` | Run it over Streamable HTTP. |
+{% endif %}
+
+Useful flags live after the subcommand:
+
+```bash
+uv run {{ cli_name }} ask "..." --max-steps 6 --quiet
+uv run {{ cli_name }} ask "..." --no-trace
+uv run {{ cli_name }} tools --transport http --server-url http://127.0.0.1:8000/mcp
+```
+
+## How it works
+
+1. `MCPClient` launches the server over stdio (or connects over HTTP) and
+   discovers tool names, descriptions, and JSON schemas.
+2. `build_system_prompt` renders those schemas into a ReAct prompt. The model is
+   told to stop at `Observation:` so it cannot invent tool output.
+3. The model replies with a `Thought`, an `Action`, and `Action Input`.
+4. The agent calls the tool over MCP, appends the observation, and loops.
+5. `Final Answer:` ends the run. Step limits, parse retries, and a forced-final
+   pass keep the loop bounded.
+
+## Configuration
+
+Settings use the `{{ env_prefix }}` prefix and load from `.env` when present.
+CLI flags override environment values.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `{{ env_prefix }}PROVIDER` | `{{ 'ollama' if llm_provider in ['ollama', 'both'] else 'openai' }}` | `ollama` or `openai`. |
+| `{{ env_prefix }}MODEL` | `{{ default_model }}` | Model name. |
+| `{{ env_prefix }}TEMPERATURE` | `0.1` | Sampling temperature. |
+{% if llm_provider in ["ollama", "both"] %}
+| `{{ env_prefix }}OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint. |
+| `{{ env_prefix }}NUM_CTX` | `8192` | Ollama context window. |
+| `{{ env_prefix }}THINK` | `false` | Enable thinking-channel output. |
+{% endif %}
+{% if llm_provider in ["openai", "both"] %}
+| `{{ env_prefix }}OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible endpoint. |
+| `{{ env_prefix }}OPENAI_API_KEY` | unset | Bearer token for the endpoint. |
+{% endif %}
+| `{{ env_prefix }}MAX_STEPS` | `8` | Maximum ReAct iterations. |
+| `{{ env_prefix }}MAX_PARSE_RETRIES` | `2` | Format-correction retries. |
+| `{{ env_prefix }}TRANSPORT` | `stdio` | `stdio` or `http`. |
+| `{{ env_prefix }}SERVER_URL` | `http://127.0.0.1:8000/mcp` | HTTP endpoint. |
+| `{{ env_prefix }}SERVER_COMMAND` | unset | JSON list for an external stdio server. |
+| `{{ env_prefix }}TRACE_DIR` | `./traces` | Trace output directory. |
+| `{{ env_prefix }}TRACE_ENABLED` | `{{ 'true' if enable_tracing else 'false' }}` | Write traces by default. |
+| `{{ env_prefix }}LOG_LEVEL` | `INFO` | Log verbosity. |
+
+See `.env.example` for the complete list.
+
+{% if include_mcp_server %}
+## Adding a tool
+
+Add a decorated function in `src/{{ package_name }}/tools.py` and restart the
+client so it rediscovers tools:
+
+```python
+@mcp.tool(title="Word count")
+@instrumented
+def word_count(text: Annotated[str, Field(description="Text to count.")]) -> int:
+    """Count whitespace-separated words."""
+    return len(text.split())
+```
+
+For progress, logs, or elicitation, make the tool `async` and add a
+`ctx: Context` parameter. The SDK injects it and hides it from the schema.
+See `docs/adding-tools.md`.
+
+{% endif %}
+## Adding a provider
+
+Implement `chat()` (and `aclose()`) from `agent/llm.py`, add it to the
+`Settings.provider` literal, and extend `build_llm`. The loop does not change.
+
+## Observability
+
+Each run writes `traces/<timestamp>-<run-id>/` with `run.json`, `spans.jsonl`,
+`events.jsonl`, and `summary.json`. Typical spans are `agent.run` >
+`agent.step` > `llm.chat` and `mcp.tools/call`.
+
+```bash
+jq -c '{name, ms:.duration_ms, status}' traces/*/spans.jsonl
+```
+
+## Testing
+
+```bash
+uv run ruff check .
+uv run ruff format --check src tests
+uv run pytest -m "not integration"
+uv run pytest
+```
+
+Model calls in tests use `FakeLLM`, so the fast suite needs no model and no
+network. Integration tests launch a real MCP subprocess.
+
+## Safety
+
+Tool arguments are untrusted.{% if include_mcp_server %} The calculator parses
+expressions with an AST allowlist instead of `eval`.{% endif %} If you add file
+tools, resolve paths against a fixed workspace root and reject absolute paths
+and traversal. The HTTP transport binds to loopback and has no authentication;
+do not expose it publicly without auth and TLS.

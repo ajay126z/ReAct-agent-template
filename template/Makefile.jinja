@@ -1,0 +1,47 @@
+.PHONY: sync test lint format check tools ask chat chat-session chat-continue serve inspect clean
+
+sync:
+	uv sync --all-extras
+
+test:
+	uv run pytest
+
+lint:
+	uv run ruff check .
+
+format:
+	uv run ruff format src tests
+
+check:
+	uv run ruff check . && uv run ruff format --check src tests && uv run pytest -q
+
+tools:
+	uv run {{ cli_name }} tools
+
+ask:
+	uv run {{ cli_name }} ask "What is (17 * 3) + 9, and what time is it in UTC?"
+
+chat:
+	uv run {{ cli_name }} repl
+
+{% if include_sessions %}
+chat-session:
+	@test -n "$(SESSION)" || (echo "Usage: make chat-session SESSION=research"; exit 1)
+	uv run {{ cli_name }} repl --session "$(SESSION)"
+
+chat-continue:
+	uv run {{ cli_name }} repl --continue
+
+{% endif %}
+{% if include_mcp_server %}
+serve:
+	uv run {{ cli_name }} serve
+
+{% endif %}
+{% if include_mcp_server %}
+inspect:
+	uv run mcp dev src/{{ package_name }}/server.py
+
+{% endif %}
+clean:
+	rm -rf traces .pytest_cache .ruff_cache

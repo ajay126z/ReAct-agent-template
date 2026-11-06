@@ -1,0 +1,83 @@
+"""MCP server entrypoint.
+
+Run over stdio (the default, used by the client subprocess)::
+
+    python -m {{ package_name }}.server
+
+Or over Streamable HTTP for inspection::
+
+    python -m {{ package_name }}.server --http --port 8000
+"""
+
+from __future__ import annotations
+
+import argparse
+
+from mcp.server import MCPServer
+
+from . import __version__
+from .config import Settings
+from .observability.logging import get_logger, setup_logging
+from .tools import Toolbox, register_tools
+
+log = get_logger("server")
+
+INSTRUCTIONS = """\
+Local MCP server for a ReAct agent. Use the calculator for deterministic
+arithmetic and get_current_time for timezone-aware current time. Prefer tools
+over guessing, and never invent an observation.
+"""
+
+
+def create_server(settings: Settings | None = None) -> MCPServer:
+    """Build a fully registered MCP server (also used by in-memory tests)."""
+    settings = settings or Settings()
+    settings.ensure_dirs()
+
+    server = MCPServer(
+        "{{ project_name }} Tools",
+        version=__version__,
+        instructions=INSTRUCTIONS,
+        log_level=settings.log_level,
+    )
+    toolbox = Toolbox(settings)
+    register_tools(server, toolbox)
+    return server
+
+
+# Module-level instance so `mcp dev` and `mcp run` work.
+mcp = create_server()
+
+
+def run_server(
+    *,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    settings: Settings | None = None,
+) -> None:
+    settings = settings or Settings()
+    setup_logging(settings.log_level)
+    server = create_server(settings)
+    if transport == "stdio":
+        server.run()
+    else:
+        server.run(transport="streamable-http", host=host, port=port)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="{{ package_name }}.server", description=__doc__)
+    parser.add_argument("--http", action="store_true", help="Serve Streamable HTTP")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args(argv)
+    run_server(
+        transport="http" if args.http else "stdio",
+        host=args.host,
+        port=args.port,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import pytest
+from mcp.server.mcpserver.exceptions import ToolError
+
+from {{ package_name }}.config import Settings
+from {{ package_name }}.tools import Toolbox
+
+
+@pytest.fixture
+def toolbox(settings: Settings) -> Toolbox:
+    return Toolbox(settings)
+
+
+def test_calculator_arithmetic(toolbox: Toolbox) -> None:
+    assert toolbox.calculator("(17 * 3) + 9") == "60"
+    assert toolbox.calculator("2 ** 10") == "1024"
+    assert toolbox.calculator("1 / 3") == "0.333333333333"
+
+
+def test_calculator_rejects_names(toolbox: Toolbox) -> None:
+    with pytest.raises(ToolError):
+        toolbox.calculator("__import__('os').system('echo hi')")
+
+
+def test_calculator_rejects_division_by_zero(toolbox: Toolbox) -> None:
+    with pytest.raises(ToolError, match="Division by zero"):
+        toolbox.calculator("1 / 0")
+
+
+def test_calculator_rejects_huge_exponent(toolbox: Toolbox) -> None:
+    with pytest.raises(ToolError):
+        toolbox.calculator("2 ** 10000")
+
+
+def test_current_time_utc(toolbox: Toolbox) -> None:
+    value = toolbox.current_time("UTC")
+    assert value.endswith(")")
+    assert "T" in value
+
+
+def test_unknown_timezone(toolbox: Toolbox) -> None:
+    with pytest.raises(ToolError, match="Unknown timezone"):
+        toolbox.current_time("Mars/Olympus_Mons")

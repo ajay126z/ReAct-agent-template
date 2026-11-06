@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+import pytest
+
+from {{ package_name }}.agent.parser import parse_react_output
+
+
+def test_final_answer() -> None:
+    parsed = parse_react_output("Thought: done\nFinal Answer: 42")
+    assert parsed.kind == "final"
+    assert parsed.final_answer == "42"
+    assert parsed.thought == "done"
+
+
+def test_action_with_json() -> None:
+    parsed = parse_react_output(
+        'Thought: need math\nAction: calculator\nAction Input: {"expression": "2 * 3"}'
+    )
+    assert parsed.kind == "action"
+    assert parsed.action == "calculator"
+    assert parsed.arguments == {"expression": "2 * 3"}
+
+
+def test_action_input_single_quote_dict() -> None:
+    parsed = parse_react_output(
+        "Thought: math\nAction: calculator\nAction Input: {'expression': '2 + 2'}"
+    )
+    assert parsed.kind == "action"
+    assert parsed.arguments == {"expression": "2 + 2"}
+
+
+def test_fenced_final_answer() -> None:
+    parsed = parse_react_output("```\nThought: done\nFinal Answer: hello\n```")
+    assert parsed.kind == "final"
+    assert parsed.final_answer == "hello"
+
+
+def test_invalid_output() -> None:
+    parsed = parse_react_output("I think the answer is 42.")
+    assert parsed.kind == "invalid"
+    assert parsed.error
+
+
+def test_final_wins_over_later_action() -> None:
+    parsed = parse_react_output(
+        'Thought: done\nFinal Answer: 7\nAction: calculator\nAction Input: {"expression": "7"}'
+    )
+    assert parsed.kind == "final"
+    assert parsed.final_answer == "7"
+
+
+def test_action_input_ignores_observation() -> None:
+    parsed = parse_react_output(
+        'Action: calculator\nAction Input: {"expression": "1 + 1"}\nObservation: 2'
+    )
+    assert parsed.arguments == {"expression": "1 + 1"}
+
+
+def test_missing_action_input_is_reported() -> None:
+    parsed = parse_react_output("Action: calculator")
+    assert parsed.kind == "action"
+    assert parsed.arguments == {}
+    assert parsed.error is None
+
+
+@pytest.mark.parametrize("text", ["", "   ", "Thought: only thinking"])
+def test_empty_or_thought_only(text: str) -> None:
+    assert parse_react_output(text).kind == "invalid"

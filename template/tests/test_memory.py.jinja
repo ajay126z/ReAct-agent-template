@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from {{ package_name }}.agent.memory import ConversationMemory, ConversationTurn, SessionStore
+
+
+def test_memory_trims_by_turn_count() -> None:
+    memory = ConversationMemory(max_turns=2, max_chars=10_000)
+    for index in range(3):
+        memory.add(ConversationTurn.create(f"q{index}", f"a{index}"))
+
+    assert [turn.question for turn in memory.turns] == ["q1", "q2"]
+
+
+def test_memory_trims_by_character_budget() -> None:
+    memory = ConversationMemory(max_turns=10, max_chars=10)
+    memory.add(ConversationTurn.create("12345", "12345"))
+    memory.add(ConversationTurn.create("12345", "12345"))
+
+    assert len(memory) == 1
+    assert memory.turns[0].question == "12345"
+
+
+def test_session_round_trip(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    store.append("demo", ConversationTurn.create("question", "answer", model="m"))
+
+    memory = store.load("demo", max_turns=6, max_chars=4000)
+
+    assert len(memory) == 1
+    assert memory.turns[0].question == "question"
+    assert memory.turns[0].answer == "answer"
+    assert store.latest() == "demo"
+    assert [session.name for session in store.list_sessions()] == ["demo"]
+
+
+def test_session_reset_archives(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    store.append("demo", ConversationTurn.create("q", "a"))
+
+    archived = store.reset("demo")
+
+    assert archived is not None and archived.is_file()
+    assert not store.exists("demo")
+
+
+def test_session_delete(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    store.append("demo", ConversationTurn.create("q", "a"))
+
+    assert store.delete("demo") is True
+    assert store.delete("demo") is False
+    assert store.latest() is None
+
+
+def test_rejects_path_traversal(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    try:
+        store.path("../escape")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")

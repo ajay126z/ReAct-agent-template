@@ -1,0 +1,309 @@
+"""LLM adapters behind one small protocol.
+
+The ReAct loop only needs ``chat()``. Provider-specific request shapes, token
+accounting, and error messages live here so the loop stays readable.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+
+import httpx
+{% if llm_provider in ["ollama", "both"] -%}
+from ollama import AsyncClient, ResponseError
+{% endif %}
+
+from ..config import Settings
+from ..observability.logging import get_logger
+from ..observability.tracer import Tracer
+
+log = get_logger("llm")
+
+
+class LLMError(RuntimeError):
+    """A model call failed in a way the user can fix."""
+
+
+@dataclass(slots=True)
+class LLMResponse:
+    content: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    duration_ms: float = 0.0
+    done_reason: str | None = None
+    thinking: str | None = None
+
+
+@runtime_checkable
+class LLM(Protocol):
+    """What the agent needs from a model provider."""
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        stop: list[str] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse: ...
+
+    async def aclose(self) -> None: ...
+
+
+class FakeLLM:
+    """Scripted responses for tests and offline experimentation."""
+
+    def __init__(self, responses: Iterable[str] = ()) -> None:
+        self.responses = list(responses)
+        self.calls: list[list[dict[str, str]]] = []
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        stop: list[str] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        self.calls.append([dict(message) for message in messages])
+        if not self.responses:
+            raise LLMError("FakeLLM ran out of scripted responses.")
+        content = self.responses.pop(0)
+        prompt_chars = sum(len(message.get("content", "")) for message in messages)
+        return LLMResponse(
+            content=content,
+            prompt_tokens=prompt_chars // 4,
+            completion_tokens=len(content) // 4,
+        )
+
+    async def aclose(self) -> None:
+        return None
+{% if llm_provider in ["ollama", "both"] %}
+{{ "\n\n" }}class OllamaLLM:
+    """Async Ollama client for one configured model."""
+
+    def __init__(self, settings: Settings, *, tracer: Tracer | None = None) -> None:
+        self.settings = settings
+        self.tracer = tracer
+        self.client = AsyncClient(host=settings.ollama_host, timeout=settings.request_timeout)
+
+    async def list_models(self) -> list[str]:
+        try:
+            response = await self.client.list()
+        except Exception as exc:  # pragma: no cover - environmental
+            raise LLMError(self._explain(exc)) from exc
+        models = getattr(response, "models", None) or []
+        names: list[str] = []
+        for model in models:
+            name = getattr(model, "model", None) or getattr(model, "name", None)
+            if name:
+                names.append(str(name))
+        return names
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        stop: list[str] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        options: dict[str, Any] = {
+            "temperature": self.settings.temperature if temperature is None else temperature,
+            "num_ctx": self.settings.num_ctx,
+        }
+        if stop:
+            options["stop"] = stop
+
+        started = time.perf_counter()
+        try:
+            response = await self.client.chat(
+                model=self.settings.model,
+                messages=messages,
+                stream=False,
+                think=self.settings.think,
+                options=options,
+                keep_alive=self.settings.keep_alive,
+            )
+        except Exception as exc:
+            raise LLMError(self._explain(exc)) from exc
+        duration_ms = (time.perf_counter() - started) * 1000
+        result = self._to_response(response, duration_ms)
+
+        if self.tracer is not None:
+            with self.tracer.span(
+                "llm.chat",
+                kind="client",
+                provider="ollama",
+                model=self.settings.model,
+                message_count=len(messages),
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                duration_ms=round(result.duration_ms, 3),
+            ):
+                pass
+        log.debug(
+            "llm response model=%s prompt_tokens=%s completion_tokens=%s duration_ms=%.0f",
+            self.settings.model,
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.duration_ms,
+        )
+        return result
+
+    async def aclose(self) -> None:
+        return None
+
+    @staticmethod
+    def _to_response(response: Any, duration_ms: float) -> LLMResponse:
+        message = getattr(response, "message", None)
+        content = (getattr(message, "content", None) or "").strip()
+        thinking = getattr(message, "thinking", None)
+        if not content and thinking:
+            log.warning("model returned empty content; falling back to its thinking text")
+            content = str(thinking).strip()
+        return LLMResponse(
+            content=content,
+            prompt_tokens=int(getattr(response, "prompt_eval_count", 0) or 0),
+            completion_tokens=int(getattr(response, "eval_count", 0) or 0),
+            duration_ms=duration_ms,
+            done_reason=getattr(response, "done_reason", None),
+            thinking=thinking,
+        )
+
+    def _explain(self, exc: Exception) -> str:
+        host = self.settings.ollama_host
+        model = self.settings.model
+        if isinstance(exc, ResponseError):
+            text = str(exc)
+            if "not found" in text.lower():
+                return (
+                    f"Ollama could not find model {model!r}. Run `ollama list` and "
+                    f"`ollama pull {model}`, or pass --model with an installed model."
+                )
+            return f"Ollama returned an error: {text}"
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            return (
+                f"Could not connect to Ollama at {host}. Start it with `ollama serve` "
+                "or set {{ env_prefix }}OLLAMA_HOST."
+            )
+        if isinstance(exc, httpx.ReadTimeout):
+            return (
+                f"Ollama timed out after {self.settings.request_timeout}s. "
+                "Try a smaller model, a smaller context window, or a larger timeout."
+            )
+        return f"Ollama call failed: {type(exc).__name__}: {exc}"
+{% endif %}
+{% if llm_provider in ["openai", "both"] %}
+{{ "\n\n" }}class OpenAICompatibleLLM:
+    """Chat adapter for ``/v1/chat/completions`` endpoints."""
+
+    def __init__(self, settings: Settings, *, tracer: Tracer | None = None) -> None:
+        self.settings = settings
+        self.tracer = tracer
+        headers = {"Content-Type": "application/json"}
+        if settings.openai_api_key:
+            headers["Authorization"] = f"Bearer {settings.openai_api_key}"
+        self.client = httpx.AsyncClient(
+            base_url=settings.openai_base_url.rstrip("/") + "/",
+            timeout=settings.request_timeout,
+            headers=headers,
+        )
+
+    async def list_models(self) -> list[str]:
+        try:
+            response = await self.client.get("models")
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise LLMError(
+                f"Could not list models at {self.settings.openai_base_url}: {exc}"
+            ) from exc
+        data = response.json()
+        return [str(item["id"]) for item in data.get("data", []) if item.get("id")]
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        stop: list[str] | None = None,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        payload: dict[str, Any] = {
+            "model": self.settings.model,
+            "messages": messages,
+            "stream": False,
+            "temperature": self.settings.temperature if temperature is None else temperature,
+        }
+        if stop:
+            payload["stop"] = stop
+        if self.settings.max_tokens is not None:
+            payload["max_tokens"] = self.settings.max_tokens
+
+        started = time.perf_counter()
+        try:
+            response = await self.client.post("chat/completions", json=payload)
+        except httpx.HTTPError as exc:
+            raise LLMError(
+                f"Could not reach {self.settings.openai_base_url}: {type(exc).__name__}: {exc}"
+            ) from exc
+        duration_ms = (time.perf_counter() - started) * 1000
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            raise LLMError(
+                f"Provider returned HTTP {response.status_code}: {detail or '(no body)'}"
+            )
+
+        try:
+            data = response.json()
+            content = data["choices"][0]["message"].get("content") or ""
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"Unexpected provider response: {response.text[:500]}") from exc
+
+        usage = data.get("usage") or {}
+        result = LLMResponse(
+            content=str(content).strip(),
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+            duration_ms=duration_ms,
+            done_reason=data["choices"][0].get("finish_reason"),
+        )
+
+        if self.tracer is not None:
+            with self.tracer.span(
+                "llm.chat",
+                kind="client",
+                provider="openai",
+                model=self.settings.model,
+                message_count=len(messages),
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                duration_ms=round(result.duration_ms, 3),
+            ):
+                pass
+        log.debug(
+            "llm response model=%s prompt_tokens=%s completion_tokens=%s duration_ms=%.0f",
+            self.settings.model,
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.duration_ms,
+        )
+        return result
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+{% endif %}
+
+
+def build_llm(settings: Settings, *, tracer: Tracer | None = None) -> LLM:
+    """Build the adapter selected by ``settings.provider``."""
+    if settings.provider == "fake":
+        return FakeLLM()
+{% if llm_provider in ["ollama", "both"] %}
+    if settings.provider == "ollama":
+        return OllamaLLM(settings, tracer=tracer)
+{% endif %}
+{% if llm_provider in ["openai", "both"] %}
+    if settings.provider == "openai":
+        return OpenAICompatibleLLM(settings, tracer=tracer)
+{% endif %}
+    raise LLMError(f"Unsupported provider: {settings.provider!r}")

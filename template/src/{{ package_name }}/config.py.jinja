@@ -1,0 +1,108 @@
+"""Configuration loaded from the environment and ``.env``.
+
+Every setting is prefixed with ``{{ env_prefix }}``. CLI flags override the
+environment, and ``server_env()`` decides which values reach the MCP server
+subprocess.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Literal
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TRACES = PROJECT_ROOT / "traces"
+{% if include_sessions %}
+DEFAULT_SESSIONS = PROJECT_ROOT / "data" / "sessions"
+{% endif %}
+
+
+class Settings(BaseSettings):
+    """Environment-driven settings with the ``{{ env_prefix }}`` prefix."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="{{ env_prefix }}",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # LLM
+{% if llm_provider == "both" %}
+    provider: Literal["ollama", "openai", "fake"] = "ollama"
+{% elif llm_provider == "ollama" %}
+    provider: Literal["ollama", "fake"] = "ollama"
+{% else %}
+    provider: Literal["openai", "fake"] = "openai"
+{% endif %}
+    model: str = "{{ default_model }}"
+    temperature: float = Field(default=0.1, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    request_timeout: float = Field(default=120.0, gt=0)
+
+    # Ollama
+    ollama_host: str = "http://localhost:11434"
+    num_ctx: int = Field(default=8192, ge=512)
+    keep_alive: str = "10m"
+    think: bool = False
+
+    # OpenAI-compatible endpoints (OpenAI, vLLM, LM Studio, OpenRouter, ...)
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_api_key: str | None = None
+
+    # Agent loop
+    max_steps: int = Field(default=8, ge=1, le=50)
+    max_parse_retries: int = Field(default=2, ge=0, le=10)
+    max_observation_chars: int = Field(default=2000, ge=100)
+{% if include_sessions %}
+    memory_turns: int = Field(default=6, ge=1, le=50)
+    memory_chars: int = Field(default=4000, ge=100, le=100_000)
+{% endif %}
+
+    # MCP transport
+    transport: Literal["stdio", "http"] = "stdio"
+    server_url: str = "http://127.0.0.1:8000/mcp"
+    server_command: str | None = None
+
+    # Observability
+    trace_dir: Path = DEFAULT_TRACES
+    trace_enabled: bool = {{ "True" if enable_tracing else "False" }}
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+{% if include_sessions %}
+    session_dir: Path = DEFAULT_SESSIONS
+{% endif %}
+
+    @field_validator("trace_dir"{% if include_sessions %}, "session_dir"{% endif %})
+    @classmethod
+    def _resolve_path(cls, value: Path) -> Path:
+        return value if value.is_absolute() else (Path.cwd() / value).resolve()
+
+    def ensure_dirs(self) -> None:
+        """Create the directories the CLI and server write to."""
+        self.trace_dir.mkdir(parents=True, exist_ok=True)
+{% if include_sessions %}
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+{% endif %}
+
+    def server_env(self) -> dict[str, str]:
+        """Environment for the stdio MCP server subprocess.
+
+        ``StdioServerParameters`` replaces the child environment when ``env`` is
+        provided, so start from the parent environment and add server settings
+        explicitly. Add new server-side settings here.
+        """
+        return {
+            **os.environ,
+            "{{ env_prefix }}LOG_LEVEL": self.log_level,
+        }
+
+
+def load_settings(**overrides: object) -> Settings:
+    """Load settings from the environment, then apply non-None overrides."""
+    settings = Settings()
+    clean = {key: value for key, value in overrides.items() if value is not None}
+    return settings.model_copy(update=clean) if clean else settings

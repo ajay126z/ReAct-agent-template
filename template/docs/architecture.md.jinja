@@ -1,0 +1,93 @@
+# Architecture
+
+The project keeps four pieces separate so each can be replaced or tested on its
+own:
+
+```text
+CLI (ask / repl)
+      |
+      v
+ReActAgent  <---- LLM protocol ----> OllamaLLM / OpenAICompatibleLLM / FakeLLM
+      |
+      v
+MCPToolClient protocol
+      |
+      v
+MCPClient (official SDK)
+      |
+      v
+MCP server over stdio or HTTP
+```
+
+## The loop
+
+1. `MCPClient.list_tools()` returns normalized `ToolSpec` objects.
+2. `build_system_prompt()` renders names, descriptions, and JSON schemas.
+3. The model replies with one of:
+
+   ```text
+   Thought: ...
+   Action: <tool>
+   Action Input: <JSON object>
+   ```
+
+   or
+
+   ```text
+   Thought: ...
+   Final Answer: ...
+   ```
+
+4. The parser extracts the action. If parsing fails, the loop injects a retry
+   prompt a bounded number of times.
+5. `MCPClient.call_tool()` executes the action. The result becomes an
+   `Observation:` message.
+6. The loop stops on `Final Answer`, the step limit, or an unrecoverable parse
+   error. A forced-final pass asks for an answer without tools.
+
+The model is called with `stop=["Observation:"]`. That single detail prevents
+the model from writing fake tool output.
+
+## Interfaces
+
+`agent/llm.py`:
+
+- `LLM.chat(messages, stop=..., temperature=...) -> LLMResponse`
+- `LLM.aclose()`
+
+`mcp_client/base.py`:
+
+- `MCPToolClient.list_tools() -> list[ToolSpec]`
+- `MCPToolClient.call_tool(name, arguments) -> ToolResult`
+
+Neither interface knows about the CLI, settings, or tracing.
+
+## Tracing
+
+`observability/tracer.py` writes one directory per run:
+
+| File | Contents |
+| --- | --- |
+| `run.json` | Run id, start time, environment metadata. |
+| `spans.jsonl` | One nested span per line, with duration and status. |
+| `events.jsonl` | Standalone timestamped events. |
+| `summary.json` | Span counts, metrics, artifact paths. |
+
+Typical spans: `agent.run` > `agent.step` > `llm.chat` and `mcp.tools/call`.
+The tracer uses a `ContextVar`, so nesting works without passing spans around.
+
+## Error handling
+
+- Provider failures become `LLMError` with actionable text.
+- Transport failures become `MCPClientError`.
+- Tool failures are observations, not crashes. The model can correct itself.
+- Parse failures become a retry prompt, then a forced final answer.
+
+## Transports
+
+- `stdio`: `MCPClient` launches an MCP server subprocess and talks JSON-RPC over
+  its stdin/stdout.
+- `http`: `MCPClient` connects to a Streamable HTTP endpoint.
+
+The server must never log to stdout in stdio mode; stdout is the wire. Logging
+always goes to stderr.

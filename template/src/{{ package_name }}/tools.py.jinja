@@ -1,0 +1,164 @@
+"""Sample MCP tools.
+
+Keep implementation logic on ``Toolbox`` and register thin wrappers in
+``register_tools``. ``@instrumented`` must stay closest to the function so
+``functools.wraps`` preserves the signature the SDK turns into JSON Schema.
+"""
+
+from __future__ import annotations
+
+import ast
+import functools
+import operator
+import time
+from datetime import datetime
+from typing import Annotated, Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from .config import Settings
+from .observability.logging import get_logger
+
+log = get_logger("tools")
+
+MAX_EXPRESSION_CHARS = 256
+MAX_EXPONENT = 100
+MAX_ABS_RESULT = 1e100
+
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def instrumented(fn):
+    """Log tool entry/exit without changing the wrapped signature."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        log.info("tool.start name=%s", fn.__name__)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            log.warning("tool.error name=%s error=%s", fn.__name__, exc)
+            raise
+        finally:
+            duration = (time.perf_counter() - started) * 1000
+            log.info("tool.end name=%s duration_ms=%.1f", fn.__name__, duration)
+
+    return wrapper
+
+
+class Toolbox:
+    """Stateful implementation behind the MCP tools."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.settings.ensure_dirs()
+
+    # -- calculator -------------------------------------------------------
+    def calculator(self, expression: str) -> str:
+        expression = expression.strip()
+        if not expression:
+            raise ToolError("The expression is empty.")
+        if len(expression) > MAX_EXPRESSION_CHARS:
+            raise ToolError(f"Expression is too long (max {MAX_EXPRESSION_CHARS} characters).")
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except SyntaxError as exc:
+            raise ToolError(f"Could not parse expression: {exc.msg}") from exc
+
+        value = self._eval_node(tree.body)
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ToolError("Result is not a finite number.")
+            if abs(value) > MAX_ABS_RESULT:
+                raise ToolError("Result is too large.")
+            return format(value, ".12g")
+        return str(value)
+
+    def _eval_node(self, node: ast.AST) -> int | float:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                raise ToolError("Only integer and float constants are allowed.")
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+            left = self._eval_node(node.left)
+            right = self._eval_node(node.right)
+            if isinstance(node.op, ast.Pow):
+                if abs(right) > MAX_EXPONENT:
+                    raise ToolError(f"Exponent is too large (max {MAX_EXPONENT}).")
+                if abs(left) > 1e6:
+                    raise ToolError("Base is too large for exponentiation.")
+            try:
+                result = _BIN_OPS[type(node.op)](left, right)
+            except ZeroDivisionError as exc:
+                raise ToolError("Division by zero.") from exc
+            if isinstance(result, (int, float)) and abs(result) > MAX_ABS_RESULT:
+                raise ToolError("Intermediate result is too large.")
+            return result
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+            return _UNARY_OPS[type(node.op)](self._eval_node(node.operand))
+        raise ToolError(
+            f"Unsupported expression element: {type(node).__name__}. "
+            "Only numbers and + - * / // % ** parentheses are allowed."
+        )
+
+    # -- time -------------------------------------------------------------
+    def current_time(self, timezone: str) -> str:
+        try:
+            zone = ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ToolError(
+                f"Unknown timezone {timezone!r}. Try 'UTC' or 'America/New_York'."
+            ) from exc
+        now = datetime.now(zone)
+        return now.isoformat(timespec="seconds") + f" ({now.strftime('%A')})"
+
+
+def register_tools(mcp: MCPServer, toolbox: Toolbox) -> None:
+    """Register every MCP tool on the server."""
+
+    @mcp.tool(
+        title="Calculator",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    def calculator(
+        expression: Annotated[
+            str,
+            Field(
+                description=(
+                    "Arithmetic expression using numbers, parentheses, and + - * / // % **."
+                ),
+                examples=["(17 * 3) + 9", "2 ** 10", "1 / 3"],
+            ),
+        ],
+    ) -> str:
+        """Evaluate a basic arithmetic expression safely."""
+        return toolbox.calculator(expression)
+
+    @mcp.tool(
+        title="Current time",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
+    @instrumented
+    def get_current_time(
+        timezone: Annotated[
+            str,
+            Field(description="IANA timezone name, for example 'UTC' or 'America/New_York'."),
+        ] = "UTC",
+    ) -> str:
+        """Return the current date and time in a timezone."""
+        return toolbox.current_time(timezone)

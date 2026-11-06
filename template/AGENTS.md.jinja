@@ -1,0 +1,101 @@
+# AGENTS.md
+
+Local ReAct + MCP agent project. Read `README.md` first and
+`docs/architecture.md` before changing the loop or transports.
+
+## Commands
+
+Run through `uv`, not a bare `python` or `pytest`.
+
+- Setup: `uv sync --all-extras`
+- Lint: `uv run ruff check .`
+- Format: `uv run ruff format src tests`
+- Format check: `uv run ruff format --check src tests`
+- Fast tests: `uv run pytest -q -m "not integration"`
+- All tests: `uv run pytest -q`
+- One test: `uv run pytest -q tests/test_react_agent.py::test_action_then_final`
+- Chat: `uv run {{ cli_name }} repl`
+- One-shot: `uv run {{ cli_name }} ask "..."`
+{% if include_mcp_server %}
+- MCP server: `uv run {{ cli_name }} serve`
+{% endif %}
+- Direct tool call: `uv run {{ cli_name }} call calculator --args '{"expression":"2+2"}'`
+
+`{{ cli_name }} doctor` and `ask` need a reachable model. The test suite does
+not: it uses `FakeLLM`.
+
+## Architecture invariants
+
+- The loop is **text ReAct**, not native tool calling. Preserve
+  `stop=["Observation:"]`, the forgiving parser, and the `Final Answer:`
+  contract or agent tests will break.
+- `agent/react.py` depends only on the `LLM` protocol and `MCPToolClient`
+  protocol. Do not import a provider or the MCP SDK there.
+- `agent/parser.py` is deliberately forgiving. Add cases to
+  `tests/test_parser.py` before changing it.
+- `mcp_client/base.py` owns `ToolSpec`/`ToolResult`. The agent never sees raw
+  MCP content blocks.
+{% if include_mcp_server %}
+- `server.py:create_server()` is the single registration point for tools.
+  The module-level `mcp = create_server()` keeps `mcp dev` working.
+- The stdio server command defaults to `sys.executable -m {{ package_name }}.server`
+  in `MCPClient._stdio_params()`. Set `{{ env_prefix }}SERVER_COMMAND` to a JSON
+  list to launch an external server instead.
+{% else %}
+- `MCPClient._stdio_params()` launches the command in
+  `{{ env_prefix }}SERVER_COMMAND` (a JSON list). Set that variable, or use
+  `{{ env_prefix }}TRANSPORT=http` with `{{ env_prefix }}SERVER_URL`.
+{% endif %}
+- `Settings.server_env()` decides what reaches the stdio child. Add every new
+  server-side setting there; the child does not inherit `.env` automatically.
+{% if include_mcp_server %}
+- stdio is the default transport. `serve --http` binds `127.0.0.1` without
+  auth; do not expose it publicly.
+{% else %}
+- stdio is the default transport.
+{% endif %}
+
+## Configuration
+
+- `Settings` uses the `{{ env_prefix }}` prefix and loads `.env` from the working
+  directory. CLI flags override environment values.
+- Paths resolve against the current working directory. Run commands from the
+  project root or use absolute paths.
+- Traces live in `traces/`{% if include_sessions %}; sessions in `data/sessions/`{% endif %}.
+
+{% if include_mcp_server %}
+## Tools
+
+Implement logic on `Toolbox` in `tools.py`, then register a thin wrapper in
+`register_tools()`. Decorator order matters:
+
+```python
+@mcp.tool(title="...", annotations=ToolAnnotations(read_only_hint=True))
+@instrumented
+def my_tool(expression: str) -> str:
+    return expression
+```
+
+`@instrumented` must be closest to the function. It uses `functools.wraps`, so
+the SDK still sees the original signature and builds a clean JSON schema.
+
+For progress, logs, or elicitation, make the tool `async` and add a
+`ctx: Context` parameter. The SDK injects it and hides it from the schema. Wrap
+blocking I/O with `asyncio.to_thread`.
+
+{% endif %}
+## Tests
+
+- Use the `settings` fixture from `tests/conftest.py`; it isolates traces and
+  sessions in `tmp_path`.
+- `pytest-asyncio` runs in auto mode: plain `async def test_...` works.
+- Mark tests that launch a real server subprocess with
+  `@pytest.mark.integration`.
+- Agent tests use `FakeLLM`/`FakeClient`; assert prompts, actions, and
+  observations without a model.
+- Do not add tests that hit a live model or network.
+
+## Docs
+
+When changing the CLI{% if include_mcp_server %}, tools, protocol behavior,{% endif %} or config, update `README.md`,
+`docs/architecture.md`{% if include_mcp_server %}, `docs/adding-tools.md`{% endif %}, and `.env.example`.

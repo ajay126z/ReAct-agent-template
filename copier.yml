@@ -1,0 +1,127 @@
+_min_copier_version: "9.4.0"
+_subdirectory: template
+_templates_suffix: .jinja
+_answers_file: .copier-answers.yml
+_envops:
+  keep_trailing_newline: true
+  trim_blocks: true
+  lstrip_blocks: true
+
+_message_before_copy: |
+  Generating a ReAct + MCP agent project.
+
+_message_after_copy: |
+  Generated "{{ project_name }}" in {{ _copier_conf.dst_path }}.
+
+  Next steps:
+    cd {{ _copier_conf.dst_path }}
+    uv sync --all-extras
+    uv run {{ cli_name }} doctor
+    uv run {{ cli_name }} ask "What is (17 * 3) + 9?"
+
+project_name:
+  type: str
+  help: Human-readable project name
+  default: My Agent
+
+package_name:
+  type: str
+  help: Python import name (lower snake_case)
+  default: "{{ project_name | lower | replace(' ', '_') | replace('-', '_') | replace('.', '_') }}"
+  validator: >-
+    {% if not (package_name | regex_search('^[a-z_][a-z0-9_]*$')) %}
+    package_name must be a valid Python identifier in lower snake_case.
+    {% endif %}
+
+cli_name:
+  type: str
+  help: Command name installed by the generated project
+  default: "{{ package_name | replace('_', '-') }}"
+
+description:
+  type: str
+  help: One-line project description
+  default: "A ReAct agent that calls tools over MCP."
+
+author_name:
+  type: str
+  help: Author name (optional)
+  default: ""
+
+author_email:
+  type: str
+  help: Author email (optional)
+  default: ""
+
+env_prefix:
+  type: str
+  help: Environment variable prefix (for example MY_AGENT_)
+  default: "{{ package_name | upper }}_"
+  validator: >-
+    {% if not (env_prefix | regex_search('^[A-Z][A-Z0-9_]*$')) %}
+    env_prefix must be upper snake_case, for example MY_AGENT_.
+    {% endif %}
+
+llm_provider:
+  type: str
+  help: Which LLM adapters to include
+  choices:
+    Ollama: ollama
+    OpenAI-compatible: openai
+    Both: both
+  default: both
+
+default_model:
+  type: str
+  help: Default model name
+  default: "{{ 'qwen3.5:9b' if llm_provider in ['ollama', 'both'] else 'gpt-4o-mini' }}"
+
+include_mcp_server:
+  type: bool
+  help: Bundle a sample MCP server (calculator + current time) with the project
+  default: true
+
+include_sessions:
+  type: bool
+  help: Include JSONL conversation sessions
+  default: true
+
+enable_tracing:
+  type: bool
+  help: Write JSONL traces by default
+  default: true
+
+python_version:
+  type: str
+  help: Minimum Python version
+  choices:
+    "3.12": "3.12"
+    "3.13": "3.13"
+  default: "3.12"
+
+license:
+  type: str
+  help: License
+  choices:
+    MIT: MIT
+    Proprietary: Proprietary
+  default: MIT
+
+run_uv_sync:
+  type: bool
+  help: Run `uv sync --all-extras` after generating
+  default: false
+
+_exclude:
+  - "{% if not include_mcp_server %}src/{{ package_name }}/server.py{% endif %}"
+  - "{% if not include_mcp_server %}src/{{ package_name }}/tools.py{% endif %}"
+  - "{% if not include_mcp_server %}tests/test_mcp_integration.py{% endif %}"
+  - "{% if not include_mcp_server %}tests/test_tools.py{% endif %}"
+  - "{% if not include_mcp_server %}docs/adding-tools.md{% endif %}"
+  - "{% if not include_sessions %}src/{{ package_name }}/agent/memory.py{% endif %}"
+  - "{% if not include_sessions %}tests/test_memory.py{% endif %}"
+  - "{% if license != 'MIT' %}LICENSE{% endif %}"
+
+_tasks:
+  - command: ["uv", "sync", "--all-extras"]
+    when: "{{ run_uv_sync }}"

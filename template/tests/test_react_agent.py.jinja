@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+from typing import Any
+
+from {{ package_name }}.agent.llm import FakeLLM
+from {{ package_name }}.agent.react import AgentConfig, ReActAgent
+from {{ package_name }}.config import Settings
+from {{ package_name }}.mcp_client.base import ToolResult, ToolSpec
+
+TOOL = ToolSpec(
+    name="calculator",
+    title="Calculator",
+    description="Evaluate arithmetic.",
+    input_schema={
+        "type": "object",
+        "properties": {"expression": {"type": "string"}},
+        "required": ["expression"],
+    },
+)
+
+
+class FakeClient:
+    def __init__(self, result: str = "84") -> None:
+        self.result = result
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def list_tools(self) -> list[ToolSpec]:
+        return [TOOL]
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], *, progress_callback: Any = None
+    ) -> ToolResult:
+        self.calls.append((name, arguments))
+        return ToolResult(content=self.result)
+
+
+def make_agent(llm: FakeLLM, client: FakeClient, *, max_steps: int = 4) -> ReActAgent:
+    return ReActAgent(
+        llm=llm,
+        client=client,
+        tools=[TOOL],
+        config=AgentConfig(max_steps=max_steps, model="test-model"),
+        show_steps=False,
+    )
+
+
+async def test_action_then_final(settings: Settings) -> None:
+    llm = FakeLLM(
+        [
+            'Thought: need math\nAction: calculator\nAction Input: {"expression": "12 * 7"}',
+            "Thought: done\nFinal Answer: 84",
+        ]
+    )
+    client = FakeClient("84")
+    result = await make_agent(llm, client).run("What is 12 * 7?")
+
+    assert result.answer == "84"
+    assert result.steps == 2
+    assert result.stopped_reason == "final_answer"
+    assert client.calls == [("calculator", {"expression": "12 * 7"})]
+    assert "Observation: 84" in llm.calls[1][-1]["content"]
+    assert llm.calls[0][0]["content"].startswith("You are a ReAct agent")
+
+
+async def test_history_is_injected(settings: Settings) -> None:
+    llm = FakeLLM(["Final Answer: from history"])
+    await make_agent(llm, FakeClient()).run(
+        "follow up", history=[("first question", "first answer")]
+    )
+
+    contents = [message["content"] for message in llm.calls[0]]
+    assert "first question" in contents
+    assert "Final Answer: first answer" in contents
+
+
+async def test_parse_retry_recovers(settings: Settings) -> None:
+    llm = FakeLLM(["no format here", "Final Answer: recovered"])
+    result = await make_agent(llm, FakeClient()).run("question")
+
+    assert result.answer == "recovered"
+    assert result.metrics.parse_retries == 1
+
+
+async def test_parse_retry_limit_stops(settings: Settings) -> None:
+    llm = FakeLLM(["bad", "Final Answer: forced"])
+    agent = ReActAgent(
+        llm=llm,
+        client=FakeClient(),
+        tools=[TOOL],
+        config=AgentConfig(max_steps=4, max_parse_retries=0, model="test-model"),
+        show_steps=False,
+    )
+    result = await agent.run("question")
+
+    assert result.stopped_reason == "forced_final"
+    assert result.answer == "forced"
+
+
+async def test_unknown_tool_is_an_observation(settings: Settings) -> None:
+    llm = FakeLLM(["Action: nope\nAction Input: {}", "Final Answer: handled"])
+    result = await make_agent(llm, FakeClient()).run("question")
+
+    assert result.metrics.tool_errors == 1
+    assert "unknown tool" in result.transcript[0]["observation"]
+
+
+async def test_max_steps_forces_final(settings: Settings) -> None:
+    action = 'Action: calculator\nAction Input: {"expression": "1 + 1"}'
+    llm = FakeLLM([action, action, "Final Answer: forced"])
+    result = await make_agent(llm, FakeClient("2"), max_steps=2).run("question")
+
+    assert result.steps == 2
+    assert result.stopped_reason == "forced_final"
+    assert result.answer == "forced"
+
+
+async def test_tool_error_is_reported(settings: Settings) -> None:
+    class ErrorClient(FakeClient):
+        async def call_tool(self, name, arguments, *, progress_callback=None):
+            return ToolResult(content="bad expression", is_error=True)
+
+    llm = FakeLLM(
+        [
+            'Action: calculator\nAction Input: {"expression": "?"}',
+            "Final Answer: could not compute",
+        ]
+    )
+    result = await make_agent(llm, ErrorClient()).run("question")
+
+    assert result.metrics.tool_errors == 1
+    assert "Error from tool" in result.transcript[0]["observation"]
