@@ -15,7 +15,7 @@ Generated projects include:
 ## Use it
 
 ```bash
-uvx copier copy gh:ajay126z/agent-template my-agent
+uvx copier copy --trust gh:ajay126z/agent-template my-agent
 cd my-agent
 uv sync --all-extras
 uv run my-agent doctor
@@ -25,7 +25,7 @@ uv run my-agent ask "What is (17 * 3) + 9?"
 Or from a local checkout:
 
 ```bash
-uvx copier copy /path/to/agent-template my-agent
+uvx copier copy --trust /path/to/agent-template my-agent
 ```
 
 Non-interactive:
@@ -33,6 +33,14 @@ Non-interactive:
 ```bash
 uvx copier copy --defaults --trust . /tmp/my-agent
 ```
+
+### Why `--trust`?
+
+Copier treats template-defined tasks as unsafe because they execute commands.
+This template defines one optional task: `run_uv_sync` runs `uv sync --all-extras`
+inside the new project. Copier requires `--trust` whenever the template declares
+tasks, even if you leave `run_uv_sync=false`. If you would rather not trust the
+template, skip `--trust` and run `uv sync --all-extras` yourself after copying.
 
 ## Questions
 
@@ -51,7 +59,7 @@ uvx copier copy --defaults --trust . /tmp/my-agent
 | `enable_tracing` | `true` | Write traces by default. |
 | `python_version` | `3.12` | Minimum Python version. |
 | `license` | `MIT` | MIT or Proprietary. |
-| `run_uv_sync` | `false` | Run `uv sync` after generating. |
+| `run_uv_sync` | `false` | Run `uv sync` after generating (requires `--trust`). |
 
 ## Update a generated project
 
