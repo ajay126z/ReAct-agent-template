@@ -16,8 +16,15 @@ _message_after_copy: |
   Next steps:
     cd {{ _copier_conf.dst_path }}
     uv sync --all-extras
+  {% if include_mcp_server %}
     uv run {{ cli_name }} doctor
     uv run {{ cli_name }} ask "What is (17 * 3) + 9?"
+  {% else %}
+    # Configure an external MCP server in .env first ({{ env_prefix }}SERVER_COMMAND
+    # or {{ env_prefix }}TRANSPORT=http plus {{ env_prefix }}SERVER_URL), then:
+    uv run {{ cli_name }} doctor
+    uv run {{ cli_name }} ask "What is (17 * 3) + 9?"
+  {% endif %}
 
 project_name:
   type: str

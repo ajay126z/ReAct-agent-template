@@ -113,6 +113,37 @@ def test_optional_server_files_follow_the_flag(rendered: tuple[Path, dict[str, A
         assert present == []
 
 
+def test_docs_match_the_server_flag(rendered: tuple[Path, dict[str, Any]]) -> None:
+    project, data = rendered
+    readme = read(project / "README.md")
+    agents = read(project / "AGENTS.md")
+    cli = cli_name(data)
+
+    if data.get("include_mcp_server", True):
+        assert "docs/adding-tools.md" in readme
+        assert "docs/adding-tools.md" in agents
+        assert f"{cli} serve" in readme
+    else:
+        assert "docs/adding-tools.md" not in readme
+        assert "docs/adding-tools.md" not in agents
+        assert f"{cli} serve" not in readme
+        assert "external server" in readme
+        assert "server.py" not in agents
+
+
+def test_docs_match_the_sessions_flag(rendered: tuple[Path, dict[str, Any]]) -> None:
+    project, data = rendered
+    readme = read(project / "README.md")
+    agents = read(project / "AGENTS.md")
+
+    if data.get("include_sessions", True):
+        assert "--session" in readme
+        assert "data/sessions/" in agents
+    else:
+        assert "--session" not in readme
+        assert "data/sessions/" not in agents
+
+
 def test_optional_session_files_follow_the_flag(rendered: tuple[Path, dict[str, Any]]) -> None:
     project, data = rendered
     package = package_name(data)
